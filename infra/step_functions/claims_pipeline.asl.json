@@ -1,0 +1,93 @@
+{
+  "Comment": "Daily healthcare claims pipeline: raw -> cleansed (per entity) -> curated -> Redshift. Placeholders like ${raw_to_cleansed_job} are filled by Terraform templatefile().",
+  "StartAt": "Members",
+  "States": {
+    "Members": {
+      "Comment": "Members first: claims and pharmacy validate member ids against the PHI vault it writes.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${raw_to_cleansed_job}",
+        "Arguments": { "--ENTITY": "members", "--BATCH_DATE.$": "$.batch_date" }
+      },
+      "ResultPath": null,
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.AWSGlueException"], "IntervalSeconds": 60, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "OtherEntities"
+    },
+    "OtherEntities": {
+      "Type": "Map",
+      "Comment": "Remaining entities are independent of each other and run in parallel.",
+      "ItemsPath": "$.entities",
+      "MaxConcurrency": 5,
+      "ItemSelector": { "entity.$": "$$.Map.Item.Value", "batch_date.$": "$.batch_date" },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "RawToCleansed",
+        "States": {
+          "RawToCleansed": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {
+              "JobName": "${raw_to_cleansed_job}",
+              "Arguments": { "--ENTITY.$": "$.entity", "--BATCH_DATE.$": "$.batch_date" }
+            },
+            "Retry": [
+              { "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.AWSGlueException"], "IntervalSeconds": 60, "MaxAttempts": 3, "BackoffRate": 2.0 }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "CleansedToCurated"
+    },
+    "CleansedToCurated": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${cleansed_to_curated_job}",
+        "Arguments": { "--BATCH_DATE.$": "$.batch_date" }
+      },
+      "ResultPath": null,
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.AWSGlueException"], "IntervalSeconds": 120, "MaxAttempts": 2, "BackoffRate": 2.0 }
+      ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "LoadRedshift"
+    },
+    "LoadRedshift": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": { "JobName": "${load_redshift_job}" },
+      "ResultPath": null,
+      "Retry": [ { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 120, "MaxAttempts": 2, "BackoffRate": 2.0 } ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "NotifySuccess"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${alerts_topic_arn}",
+        "Subject": "Claims pipeline succeeded",
+        "Message.$": "States.Format('Claims pipeline succeeded for batch {}', $.batch_date)"
+      },
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${alerts_topic_arn}",
+        "Subject": "Claims pipeline FAILED",
+        "Message.$": "States.Format('Claims pipeline failed for batch {}: {}', $.batch_date, States.JsonToString($.error))"
+      },
+      "Next": "Failed"
+    },
+    "Failed": { "Type": "Fail", "Error": "ClaimsPipelineFailed" }
+  }
+}
